@@ -1,24 +1,13 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[5]:
-
-
 import math
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
-# In[8]:
-
-
 def relu_fn(x):
     """ Swish activation function """
     return x * torch.sigmoid(x)
 
-
-# In[9]:
 
 
 class Conv2dSamePadding(nn.Conv2d):
@@ -38,9 +27,6 @@ class Conv2dSamePadding(nn.Conv2d):
         return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
-# In[ ]:
-
-
 def drop_connect(inputs, p, training):
     """ Drop connect. """
     if not training: return inputs
@@ -51,9 +37,6 @@ def drop_connect(inputs, p, training):
     binary_tensor = torch.floor(random_tensor)
     output = inputs / keep_prob * binary_tensor
     return output
-
-
-# In[ ]:
 
 
 class MBConvBlock(nn.Module):
@@ -96,10 +79,7 @@ class MBConvBlock(nn.Module):
         self._project_conv = Conv2dSamePadding(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
 
-
-# In[ ]:
-
-
+        
 def forward(self, inputs, drop_connect_rate=0.2):
 
     # Expansion and Depthwise Convolution
@@ -124,3 +104,79 @@ def forward(self, inputs, drop_connect_rate=0.2):
         x = x + inputs  # skip connection
     return x
 
+
+class EfficientNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Batch norm parameters
+        bn_mom = 0.1
+        bn_eps = 1e-03
+
+        # stem
+        in_channels = 3
+        out_channels = 32
+        self._conv_stem = Conv2dSamePadding(in_channels, out_channels, kernel_size=3, stride=2, bias=False)
+        self._bn0 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+
+        # Build blocks
+        self._blocks = nn.ModuleList([]) # list 형태로 model 구성할 때
+        # stage2 r1_k3_s11_e1_i32_o16_se0.25
+        self._blocks.append(MBConvBlock(kernel_size=3, stride=1, expand_ratio=1, input_filters=32, output_filters=16, se_ratio=0.25, drop_n_add=False))
+        # stage3 r2_k3_s22_e6_i16_o24_se0.25
+        self._blocks.append(MBConvBlock(3, 2, 6, 16, 24, 0.25, False))
+        self._blocks.append(MBConvBlock(3, 1, 6, 24, 24, 0.25, True))
+        # stage4 r2_k5_s22_e6_i24_o40_se0.25
+        self._blocks.append(MBConvBlock(5, 2, 6, 24, 40, 0.25, False))
+        self._blocks.append(MBConvBlock(5, 1, 6, 40, 40, 0.25, True))
+        # stage5 r3_k3_s22_e6_i40_o80_se0.25
+        self._blocks.append(MBConvBlock(3, 2, 6, 40, 80, 0.25, False))
+        self._blocks.append(MBConvBlock(3, 1, 6, 80, 80, 0.25, True))
+        self._blocks.append(MBConvBlock(3, 1, 6, 80, 80, 0.25, True))
+        # stage6 r3_k5_s11_e6_i80_o112_se0.25
+        self._blocks.append(MBConvBlock(5, 1, 6, 80,  112, 0.25, False))
+        self._blocks.append(MBConvBlock(5, 1, 6, 112, 112, 0.25, True))
+        self._blocks.append(MBConvBlock(5, 1, 6, 112, 112, 0.25, True))
+        # stage7 r4_k5_s22_e6_i112_o192_se0.25
+        self._blocks.append(MBConvBlock(5, 2, 6, 112, 192, 0.25, False))
+        self._blocks.append(MBConvBlock(5, 1, 6, 192, 192, 0.25, True))
+        self._blocks.append(MBConvBlock(5, 1, 6, 192, 192, 0.25, True))
+        self._blocks.append(MBConvBlock(5, 1, 6, 192, 192, 0.25, True))
+        # stage8 r1_k3_s11_e6_i192_o320_se0.25
+        self._blocks.append(MBConvBlock(3, 1, 6, 192, 320, 0.25, False))
+
+        # Head 
+        in_channels = 320
+        out_channels = 1280
+        self._conv_head = Conv2dSamePadding(in_channels, out_channels, kernel_size=1, bias=False)
+        self._bn1 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+
+        # Final linear layer
+        self._dropout = 0.2
+        self._num_classes = 10
+        self._fc = nn.Linear(out_channels, self._num_classes)
+
+    def extract_features(self, inputs):
+        """ Returns output of the final convolution layer """
+
+        # Stem
+        x = relu_fn(self._bn0(self._conv_stem(inputs)))
+
+        # Blocks
+        for idx, block in enumerate(self._blocks):          
+            x = block(x)
+        return x
+
+    def forward(self, inputs):
+        """ Calls extract_features to extract features, applies final linear layer, and returns logits. """
+
+        # Convolution layers
+        x = self.extract_features(inputs)
+
+        # Head
+        x = relu_fn(self._bn1(self._conv_head(x)))
+        x = F.adaptive_avg_pool2d(x, 1).squeeze(-1).squeeze(-1)
+        if self._dropout:
+            x = F.dropout(x, p=self._dropout, training=self.training)
+        x = self._fc(x)
+        return x
